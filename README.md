@@ -1,0 +1,1 @@
+# JWT_TOKEN_BOT_VPS
