@@ -1053,7 +1053,7 @@ def delete_dashboard_file():
             os.remove(SAVED_FILE_PATH)
             auto_status["total_accounts_loaded"] = 0
             auto_status["current_file_name"] = "None"
-            return jsonify({"success": True, "message": "ড্যাশবোর্ড ফাইলটি সফলভাবে ডিলিট হয়েছে! এডমিন ডাটা সুরক্ষিত আছে।"})
+            return jsonify({"success": True, "message": "ফাইলটি সফলভাবে ডিলিট হয়েছে☠️!"})
         else:
             return jsonify({"success": False, "message": "কোনো ফাইল ডিলিট করার জন্য পাওয়া যায়নি।"})
     except Exception as e:
