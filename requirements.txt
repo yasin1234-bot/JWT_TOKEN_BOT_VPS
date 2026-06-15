@@ -3,7 +3,6 @@ aiohttp==3.11.11
 APScheduler==3.10.4
 gunicorn==23.0.0
 google-api-python-client
-gunicorn==22.0.0
 werkzeug==3.0.3
 psutil>=5.9.0
 flask-sqlalchemy
