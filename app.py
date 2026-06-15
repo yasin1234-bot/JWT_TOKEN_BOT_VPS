@@ -478,7 +478,7 @@ HTML_TEMPLATE = """
                     <h3 class="mb-4 text-info fw-bold">⚡JWT_TOKEN_GENERATOR</h3>
                     <form id="tokenForm">
                         <div class="mb-3">
-                            <label class="form-label">User ID (UID)</label>
+                            <label class="form-label">UID</label>
                             <input type="text" id="uid" class="form-control" placeholder="➔ Enter Your UID " required>
                         </div>
                         <div class="mb-3">
@@ -624,13 +624,13 @@ HTML_TEMPLATE = """
                 if(data.success) {
                     document.getElementById('totalAccountDisplay').innerText = data.count;
                     document.getElementById('activeFileName').innerText = data.filename;
-                    alert('ইউনিক ফাইল ডেটা সফলভাবে মার্জ এবং সেভ করা হয়েছে!');
+                    alert('ফাইলটি সফলভাবে এড হয়েছে!');
                 } else { alert(data.message); }
             } catch (error) { alert('ফাইল আপলোড করতে সমস্যা হয়েছে!'); }
         });
 
         document.getElementById('deleteFileBtn').addEventListener('click', async () => {
-            if (!confirm('আপনি কি নিশ্চিত যে ড্যাশবোর্ড থেকে বর্তমান ফাইলটি ডিলিট করতে চান? (এডমিন ডাটা সুরক্ষিত থাকবে)')) return;
+            if (!confirm('আপনি কি নিশ্চিত বর্তমান ফাইলটি ডিলিট করতে চান?')) return;
             try {
                 const response = await fetch('/api/delete-dashboard-file', { method: 'POST' });
                 const data = await response.json();
@@ -644,7 +644,7 @@ HTML_TEMPLATE = """
                     alert(data.message);
                 }
             } catch (error) {
-                alert('ফাইল ডিলিট করতে সার্ভারে সমস্যা হয়েছে!');
+                alert('ফাইলটি ডিলিট করতে সার্ভারে সমস্যা হয়েছে!');
             }
         });
 
