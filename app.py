@@ -86,7 +86,7 @@ async def generate_jwt_token(uid, password, http_session=None):
     try:
         encoded_password = urllib.parse.quote(password)
         cache_buster = int(time.time() * 1000)
-        url = f"https://ff-jwt-gen-api.lovable.app/api/public/token?uid={uid}&password={encoded_password}&_cb={cache_buster}"
+        url = f"https://sam-gmr-jwt-api.onrender.com/token?uid={uid}&password={encoded_password}&_cb={cache_buster}"
         
         close_session = False
         if http_session is None:
