@@ -159,8 +159,12 @@ def auto_token_job(github_token, repo, file_path, saved_file_path, user_id):
     failed_lines_list = []
     success_count = 0
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    # ফ্রি সার্ভারে থ্রেড-লোকাল ইভেন্ট লুপ ক্র্যাশ এড়াতে এই অংশটি অপ্টিমাইজ করা হয়েছে
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
     async def process_all_accounts():
         nonlocal success_count
@@ -195,14 +199,13 @@ def auto_token_job(github_token, repo, file_path, saved_file_path, user_id):
                     failed_lines_list.append(str(index))
 
             if tasks:
-                for future in asyncio.as_completed(tasks):
-                    token = await future
+                # ফ্রি মেমোরি যেন ওভারলোড না হয়, সেজন্য অ্যাসিনক্রোনাসলি টাস্কগুলো হ্যান্ডেল করা হচ্ছে
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for current_idx, token in enumerate(results):
                     status_obj["current_generating_count"] += 1
-                    
-                    current_idx = status_obj["current_generating_count"] - 1
                     if current_idx < len(line_meta):
                         meta = line_meta[current_idx]
-                        if token:
+                        if token and not isinstance(token, Exception):
                             tokens_to_upload.append({
                                 "uid": meta["uid"],
                                 "token": token,
@@ -235,8 +238,6 @@ def auto_token_job(github_token, repo, file_path, saved_file_path, user_id):
     else:
         status_obj["error"] = "All uploaded accounts failed to generate tokens."
         status_obj["total_uploaded_tokens"] = 0
-        
-    loop.close()
 
 # --- নতুন ফিঙ্গারপ্রিন্ট লগইন গেটওয়ে টেমপ্লেট ---
 LOGIN_TEMPLATE = """
@@ -898,7 +899,6 @@ ADMIN_LOGIN_TEMPLATE = """
 """
 
 # --- সিক্রেট ও প্রিমিয়াম অ্যাডমিন প্যানেল ডিজাইন ---
-# এখানে ভুল ট্যাগটি সংশোধন করা হয়েছে ({% for item in files_list %})
 ADMIN_TEMPLATE = """
 <!DOCTYPE html>
 <html lang="en">
@@ -1273,10 +1273,14 @@ def verify_github():
                         user_data = await resp.json()
                         return {"success": True, "username": user_data.get('login')}
                     return {"success": False}
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            
         result = loop.run_until_complete(fetch_user())
-        loop.close()
         return jsonify(result)
     except:
         return jsonify({"success": False}), 500
@@ -1307,10 +1311,13 @@ def get_token_route():
             except:
                 pass
 
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
     token = loop.run_until_complete(generate_jwt_token(uid, password))
-    loop.close()
     
     if token:
         return jsonify({"success": True, "token": token})
